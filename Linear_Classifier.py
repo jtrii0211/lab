@@ -1,66 +1,82 @@
-import tensorflow as tf
-import pandas as pd
+import os
+import sys
 
-COLUMNS = ['pkSeqID', 'proto', 'saddr', 'sport', 'daddr',
-                   'dport', 'seq', 'stddev', 'N_IN_Conn_P_SrcIP',
-                   'min', 'state_number', 'mean', 'N_IN_Conn_P_DstIP',
-                   'drate', 'srate', 'max', 'attack', 'category', 'subcategory']
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from IPython.display import clear_output
+from matplotlib import pyplot as plt
+import seaborn as sns
+sns_colors = sns.color_palette('colorblind')
+
+
 
 # Load dataset.
-df_train = pd.read_csv('/home/john/Downloads/UNSW_2018_IoT_Botnet_Final_10_best_Training_short.csv', header=0)
-df_test = pd.read_csv('/home/john/Downloads/UNSW_2018_IoT_Botnet_Final_10_best_Testing_short.csv', header=0)
+dftrain = pd.read_csv('/home/john/Downloads/UNSW_2018_IoT_Botnet_Final_10_best_Training.csv')
+dfeval = pd.read_csv('/home/john/Downloads/UNSW_2018_IoT_Botnet_Final_10_best_Testing.csv')
+y_train = dftrain.pop('attack')
+y_eval = dfeval.pop('attack')
 
 
-# Show datatypes
-print(df_train.shape, df_test.shape)
-print(df_train.dtypes)
-
-# Show
-print(df_train["attack"].value_counts())
-### The model will be correct in atleast 70% of the case
-print(df_test["attack"].value_counts())
-## Unbalanced label
-print(df_train.dtypes)
-
-## Add features to the bucket:
-### Define continuous list
-NUMERIC_FEATURES = ['pkSeqID', 'saddr', 'sport', 'daddr',
-                   'dport', 'seq', 'stddev', 'N_IN_Conn_P_SrcIP',
+fc = tf.feature_column
+CATEGORICAL_COLUMNS = ['proto', 'saddr', 'sport', 'daddr', 'dport', 'category', 'subcategory']
+NUMERIC_COLUMNS = ['pkSeqID', 'seq', 'stddev', 'N_IN_Conn_P_SrcIP',
                    'min', 'state_number', 'mean', 'N_IN_Conn_P_DstIP',
                    'drate', 'srate', 'max']
-### Define the categorical list
-CATEGORICAL_FEATURES = ['proto', 'category', 'subcategory']
 
-continuous_features = [tf.feature_column.numeric_column(k) for k in NUMERIC_FEATURES]
 
-categorical_features = [tf.feature_column.categorical_column_with_hash_bucket(k, hash_bucket_size=1000) for k in CATEGORICAL_FEATURES]
+feature_columns = []
+for feature_name in CATEGORICAL_COLUMNS:
+  vocabulary = dftrain[feature_name].unique()
+  feature_columns.append(tf.feature_column.categorical_column_with_vocabulary_list(feature_name, vocabulary))
 
-model = tf.estimator.LinearClassifier(
-    n_classes = 2,
-    model_dir="ongoing/train",
-    feature_columns=categorical_features + continuous_features)
+for feature_name in NUMERIC_COLUMNS:
+  feature_columns.append(tf.feature_column.numeric_column(feature_name, dtype=tf.float32))
 
-FEATURES = ['pkSeqID', 'proto', 'saddr', 'sport', 'daddr',
-            'dport', 'seq', 'stddev', 'N_IN_Conn_P_SrcIP',
-            'min', 'state_number', 'mean', 'N_IN_Conn_P_DstIP',
-            'drate', 'srate', 'max', 'category', 'subcategory']
-LABEL= 'attack'
-def get_input_fn(data_set, num_epochs=None, n_batch = 128, shuffle=True):
-    return tf.compat.v1.estimator.inputs.pandas_input_fn(
-       x=pd.DataFrame({k: data_set[k].values for k in FEATURES}),
-       y = pd.Series(data_set[LABEL].values),
-       batch_size=n_batch,
-       num_epochs=num_epochs,
-       shuffle=shuffle)
 
-model.train(input_fn=get_input_fn(df_train,
-            num_epochs=None,
-            n_batch = 128,
-            shuffle=False),
-            steps=1000)
+# Use chunks since this is such a huge dataset.
 
-model.evaluate(input_fn=get_input_fn(df_test,
+def make_input_fn(X, y):
+    def input_fn():
+        dataset = tf.data.experimental.make_csv_dataset(
+            (dict(X), y),
+            batch_size=1000, # 200 worked pretty good.
+            na_value="?",
             num_epochs=1,
-            n_batch = 128,
-            shuffle=False),
-            steps=1000)
+            shuffle=False,
+            ignore_errors=True)
+        return dataset
+    return input_fn
+
+
+train_input_fn = make_input_fn(dftrain, y_train)
+eval_input_fn = make_input_fn(dfeval, y_eval)
+
+
+# Helps generate graphs of quality of features
+params = {
+  'n_trees': 50,
+  'max_depth': 3,
+  'n_batches_per_layer': 1,
+  # You must enable center_bias = True to get DFCs. This will force the model to
+  # make an initial prediction before using any features (e.g. use the mean of
+  # the training labels for regression or log odds for classification when
+  # using cross entropy loss).
+  'center_bias': True
+}
+
+est = tf.estimator.BoostedTreesClassifier(feature_columns, **params)
+# Train model.
+est.train(train_input_fn, max_steps=100)
+# Evaluation.
+results = est.evaluate(eval_input_fn)
+
+# Make predictions.
+pred_dicts = list(est.experimental_predict_with_explanations(eval_input_fn))
+
+# Create DFC Pandas dataframe.
+labels = y_eval.values
+probs = pd.Series([pred['probabilities'][1] for pred in pred_dicts])
+df_dfc = pd.DataFrame([pred['dfc'] for pred in pred_dicts])
+df_dfc.describe().T
